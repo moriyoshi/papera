@@ -2,19 +2,25 @@ use sqlparser::ast::{ShowCreateObject, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::dialect::SourceDialect;
+use crate::dialect::{SourceDialect, TargetDialect};
 use crate::{Result, TranspileOptions};
 
-/// Transpile SHOW commands to DuckDB equivalents or information_schema queries.
+/// Transpile SHOW commands to target-dialect equivalents or information_schema queries.
 ///
 /// DuckDB natively supports: SHOW TABLES, SHOW DATABASES, SHOW SCHEMAS.
-/// For SHOW commands it supports, we pass through.
-/// For unsupported ones, we translate to information_schema queries.
+/// DataFusion natively supports: SHOW TABLES, SHOW COLUMNS, SHOW FUNCTIONS.
 pub fn rewrite_show(
     stmt: Statement,
     _dialect: SourceDialect,
-    _opts: &TranspileOptions,
+    opts: &TranspileOptions,
 ) -> Result<Statement> {
+    match opts.target {
+        TargetDialect::DuckDB => rewrite_show_duckdb(stmt),
+        TargetDialect::DataFusion => rewrite_show_datafusion(stmt),
+    }
+}
+
+fn rewrite_show_duckdb(stmt: Statement) -> Result<Statement> {
     match &stmt {
         // DuckDB supports these natively — pass through
         Statement::ShowTables { .. }
@@ -44,6 +50,30 @@ pub fn rewrite_show(
         }
 
         // Anything else — pass through and let DuckDB handle it
+        _ => Ok(stmt),
+    }
+}
+
+fn rewrite_show_datafusion(stmt: Statement) -> Result<Statement> {
+    match &stmt {
+        // DataFusion supports these natively — pass through
+        Statement::ShowTables { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowSchemas { .. }
+        | Statement::ShowFunctions { .. } => Ok(stmt),
+
+        // SHOW CREATE TABLE/VIEW → DataFusion has no system catalog for this
+        Statement::ShowCreate { .. } => Err(crate::Error::Unsupported(
+            "SHOW CREATE is not supported in DataFusion. \
+             Query information_schema.tables directly instead."
+                .to_string(),
+        )),
+
+        // SHOW VARIABLE → pass through (DataFusion supports SHOW <variable>)
+        Statement::ShowVariable { .. } => Ok(stmt),
+
+        // Anything else — pass through
         _ => Ok(stmt),
     }
 }

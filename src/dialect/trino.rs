@@ -29,7 +29,7 @@ impl Transpiler for TrinoDialect {
         };
 
         // Expression-level transforms via VisitorMut
-        let mut rewriter = ExprRewriter::new(SourceDialect::Trino);
+        let mut rewriter = ExprRewriter::new(SourceDialect::Trino, opts.target);
         rewriter.rewrite(&mut stmt)?;
 
         Ok(stmt)

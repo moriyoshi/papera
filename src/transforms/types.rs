@@ -3,17 +3,26 @@ use sqlparser::ast::{
 };
 
 use crate::Result;
-use crate::dialect::SourceDialect;
+use crate::dialect::{SourceDialect, TargetDialect};
 use crate::error::Error;
 
-/// Rewrite a DataType from source dialect to DuckDB-compatible form.
+/// Rewrite a DataType from source dialect to target-dialect-compatible form.
 /// Recurses into nested types (e.g., ARRAY element types, MAP key/value types).
-pub fn rewrite_data_type(dt: &mut DataType, dialect: SourceDialect) -> Result<()> {
-    match dialect {
-        SourceDialect::Trino => rewrite_trino_type(dt),
-        SourceDialect::Redshift => rewrite_redshift_type(dt),
+pub fn rewrite_data_type(
+    dt: &mut DataType,
+    source: SourceDialect,
+    target: TargetDialect,
+) -> Result<()> {
+    match (source, target) {
+        (SourceDialect::Trino, TargetDialect::DuckDB) => rewrite_trino_type_duckdb(dt),
+        (SourceDialect::Trino, TargetDialect::DataFusion) => rewrite_trino_type_datafusion(dt),
+        (SourceDialect::Redshift, TargetDialect::DuckDB) => rewrite_redshift_type_duckdb(dt),
+        (SourceDialect::Redshift, TargetDialect::DataFusion) => {
+            rewrite_redshift_type_datafusion(dt)
+        }
         // Hive types are similar to Trino (both use ROW, ARRAY, MAP, etc.)
-        SourceDialect::Hive => rewrite_trino_type(dt),
+        (SourceDialect::Hive, TargetDialect::DuckDB) => rewrite_trino_type_duckdb(dt),
+        (SourceDialect::Hive, TargetDialect::DataFusion) => rewrite_trino_type_datafusion(dt),
     }
 }
 
@@ -21,7 +30,7 @@ pub fn rewrite_data_type(dt: &mut DataType, dialect: SourceDialect) -> Result<()
 // Trino → DuckDB
 // ---------------------------------------------------------------------------
 
-fn rewrite_trino_type(dt: &mut DataType) -> Result<()> {
+fn rewrite_trino_type_duckdb(dt: &mut DataType) -> Result<()> {
     match dt {
         // ROW(a INTEGER, b VARCHAR) → STRUCT(a INTEGER, b VARCHAR)
         // Parsed by GenericDialect as Custom(ObjectName(["ROW"]), ["a", "INTEGER", "b", "VARCHAR"])
@@ -31,7 +40,7 @@ fn rewrite_trino_type(dt: &mut DataType) -> Result<()> {
             // Recurse into struct field types
             if let DataType::Struct(fields, _) = dt {
                 for field in fields.iter_mut() {
-                    rewrite_trino_type(&mut field.field_type)?;
+                    rewrite_trino_type_duckdb(&mut field.field_type)?;
                 }
             }
         }
@@ -39,25 +48,25 @@ fn rewrite_trino_type(dt: &mut DataType) -> Result<()> {
         // ARRAY(T) is parsed by sqlparser as Array(Parenthesis(T))
         // DuckDB prefers T[] syntax → Array(SquareBracket(T, None))
         DataType::Array(ArrayElemTypeDef::Parenthesis(inner)) => {
-            rewrite_trino_type(inner)?;
+            rewrite_trino_type_duckdb(inner)?;
             let inner_owned = std::mem::replace(inner.as_mut(), DataType::Unspecified);
             *dt = DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(inner_owned), None));
         }
         // Also handle ARRAY<T> → T[]
         DataType::Array(ArrayElemTypeDef::AngleBracket(inner)) => {
-            rewrite_trino_type(inner)?;
+            rewrite_trino_type_duckdb(inner)?;
             let inner_owned = std::mem::replace(inner.as_mut(), DataType::Unspecified);
             *dt = DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(inner_owned), None));
         }
         DataType::Array(ArrayElemTypeDef::SquareBracket(inner, _)) => {
-            rewrite_trino_type(inner)?;
+            rewrite_trino_type_duckdb(inner)?;
         }
 
         // MAP(K, V) → MAP(K, V) — already parsed as DataType::Map, passthrough
         // but recurse into key and value types
         DataType::Map(key, value) => {
-            rewrite_trino_type(key)?;
-            rewrite_trino_type(value)?;
+            rewrite_trino_type_duckdb(key)?;
+            rewrite_trino_type_duckdb(value)?;
         }
 
         // Trino VARBINARY → DuckDB BLOB
@@ -79,10 +88,66 @@ fn rewrite_trino_type(dt: &mut DataType) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Trino → DataFusion
+// ---------------------------------------------------------------------------
+
+fn rewrite_trino_type_datafusion(dt: &mut DataType) -> Result<()> {
+    match dt {
+        // ROW(a INTEGER, b VARCHAR) → STRUCT<a INTEGER, b VARCHAR>
+        // DataFusion uses angle-bracket STRUCT syntax.
+        DataType::Custom(name, modifiers) if is_name(name, "row") => {
+            let fields = parse_row_modifiers(modifiers)?;
+            *dt = DataType::Struct(fields, StructBracketKind::AngleBrackets);
+            if let DataType::Struct(fields, _) = dt {
+                for field in fields.iter_mut() {
+                    rewrite_trino_type_datafusion(&mut field.field_type)?;
+                }
+            }
+        }
+
+        // ARRAY(T) (parenthesis form) → ARRAY<T> (angle-bracket form, native to DataFusion)
+        DataType::Array(ArrayElemTypeDef::Parenthesis(inner)) => {
+            rewrite_trino_type_datafusion(inner)?;
+            let inner_owned = std::mem::replace(inner.as_mut(), DataType::Unspecified);
+            *dt = DataType::Array(ArrayElemTypeDef::AngleBracket(Box::new(inner_owned)));
+        }
+        // ARRAY<T> → passthrough (already correct for DataFusion), but recurse
+        DataType::Array(ArrayElemTypeDef::AngleBracket(inner)) => {
+            rewrite_trino_type_datafusion(inner)?;
+        }
+        // T[] → ARRAY<T>
+        DataType::Array(ArrayElemTypeDef::SquareBracket(inner, _)) => {
+            rewrite_trino_type_datafusion(inner)?;
+            let inner_owned = std::mem::replace(inner.as_mut(), DataType::Unspecified);
+            *dt = DataType::Array(ArrayElemTypeDef::AngleBracket(Box::new(inner_owned)));
+        }
+
+        // MAP(K, V) — recurse into key/value types
+        DataType::Map(key, value) => {
+            rewrite_trino_type_datafusion(key)?;
+            rewrite_trino_type_datafusion(value)?;
+        }
+
+        // Trino VARBINARY → DataFusion BYTEA (no BLOB in DataFusion)
+        DataType::Varbinary(_) => {
+            *dt = DataType::Bytea;
+        }
+
+        // Trino IPADDRESS → VARCHAR
+        DataType::Custom(name, modifiers) if is_name(name, "ipaddress") && modifiers.is_empty() => {
+            *dt = DataType::Varchar(None);
+        }
+
+        _ => {}
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Redshift → DuckDB
 // ---------------------------------------------------------------------------
 
-fn rewrite_redshift_type(dt: &mut DataType) -> Result<()> {
+fn rewrite_redshift_type_duckdb(dt: &mut DataType) -> Result<()> {
     match dt {
         // VARCHAR(MAX) → VARCHAR (unbounded)
         DataType::Varchar(Some(CharacterLength::Max)) => {
@@ -121,6 +186,52 @@ fn rewrite_redshift_type(dt: &mut DataType) -> Result<()> {
 
         // TIMETZ / TIMESTAMPTZ pass through (DuckDB supports these)
         // Standard types pass through
+        _ => {}
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Redshift → DataFusion
+// ---------------------------------------------------------------------------
+
+fn rewrite_redshift_type_datafusion(dt: &mut DataType) -> Result<()> {
+    match dt {
+        // VARCHAR(MAX) → VARCHAR (unbounded)
+        DataType::Varchar(Some(CharacterLength::Max)) => {
+            *dt = DataType::Varchar(None);
+        }
+        DataType::CharacterVarying(Some(CharacterLength::Max)) => {
+            *dt = DataType::Varchar(None);
+        }
+        DataType::Nvarchar(Some(CharacterLength::Max)) => {
+            *dt = DataType::Varchar(None);
+        }
+
+        // SUPER → VARCHAR (DataFusion has no JSON type; store as text)
+        DataType::Custom(name, modifiers) if is_name(name, "super") && modifiers.is_empty() => {
+            *dt = DataType::Varchar(None);
+        }
+
+        // HLLSKETCH → unsupported
+        DataType::Custom(name, modifiers) if is_name(name, "hllsketch") && modifiers.is_empty() => {
+            return Err(Error::Unsupported(
+                "Redshift HLLSKETCH type has no DataFusion equivalent".to_string(),
+            ));
+        }
+
+        // GEOMETRY → unsupported
+        DataType::Custom(name, modifiers) if is_name(name, "geometry") && modifiers.is_empty() => {
+            return Err(Error::Unsupported(
+                "Redshift GEOMETRY type has no direct DataFusion equivalent".to_string(),
+            ));
+        }
+
+        // Redshift VARBINARY → DataFusion BYTEA
+        DataType::Varbinary(_) => {
+            *dt = DataType::Bytea;
+        }
+
         _ => {}
     }
     Ok(())
@@ -190,25 +301,26 @@ fn parse_type_string(s: &str) -> Result<DataType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dialect::TargetDialect;
 
     #[test]
     fn redshift_varchar_max() {
         let mut dt = DataType::Varchar(Some(CharacterLength::Max));
-        rewrite_data_type(&mut dt, SourceDialect::Redshift).unwrap();
+        rewrite_data_type(&mut dt, SourceDialect::Redshift, TargetDialect::DuckDB).unwrap();
         assert_eq!(dt, DataType::Varchar(None));
     }
 
     #[test]
     fn redshift_super_to_json() {
         let mut dt = DataType::Custom(ObjectName::from(vec![Ident::new("SUPER")]), vec![]);
-        rewrite_data_type(&mut dt, SourceDialect::Redshift).unwrap();
+        rewrite_data_type(&mut dt, SourceDialect::Redshift, TargetDialect::DuckDB).unwrap();
         assert_eq!(dt, DataType::JSON);
     }
 
     #[test]
     fn trino_varbinary_to_blob() {
         let mut dt = DataType::Varbinary(None);
-        rewrite_data_type(&mut dt, SourceDialect::Trino).unwrap();
+        rewrite_data_type(&mut dt, SourceDialect::Trino, TargetDialect::DuckDB).unwrap();
         assert_eq!(dt, DataType::Blob(None));
     }
 
@@ -223,7 +335,7 @@ mod tests {
                 "VARCHAR".to_string(),
             ],
         );
-        rewrite_data_type(&mut dt, SourceDialect::Trino).unwrap();
+        rewrite_data_type(&mut dt, SourceDialect::Trino, TargetDialect::DuckDB).unwrap();
         match &dt {
             DataType::Struct(fields, StructBracketKind::Parentheses) => {
                 assert_eq!(fields.len(), 2);
@@ -232,5 +344,41 @@ mod tests {
             }
             other => panic!("Expected Struct, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trino_varbinary_to_bytea_datafusion() {
+        let mut dt = DataType::Varbinary(None);
+        rewrite_data_type(&mut dt, SourceDialect::Trino, TargetDialect::DataFusion).unwrap();
+        assert_eq!(dt, DataType::Bytea);
+    }
+
+    #[test]
+    fn trino_row_to_struct_datafusion() {
+        let mut dt = DataType::Custom(
+            ObjectName::from(vec![Ident::new("ROW")]),
+            vec![
+                "a".to_string(),
+                "INTEGER".to_string(),
+                "b".to_string(),
+                "VARCHAR".to_string(),
+            ],
+        );
+        rewrite_data_type(&mut dt, SourceDialect::Trino, TargetDialect::DataFusion).unwrap();
+        match &dt {
+            DataType::Struct(fields, StructBracketKind::AngleBrackets) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].field_name.as_ref().unwrap().value, "a");
+                assert_eq!(fields[1].field_name.as_ref().unwrap().value, "b");
+            }
+            other => panic!("Expected Struct<>, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redshift_super_to_varchar_datafusion() {
+        let mut dt = DataType::Custom(ObjectName::from(vec![Ident::new("SUPER")]), vec![]);
+        rewrite_data_type(&mut dt, SourceDialect::Redshift, TargetDialect::DataFusion).unwrap();
+        assert_eq!(dt, DataType::Varchar(None));
     }
 }

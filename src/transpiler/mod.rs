@@ -6,7 +6,7 @@ use crate::TranspileOptions;
 
 /// Trait for dialect-specific transpilation logic.
 pub trait Transpiler {
-    /// Transform a parsed SQL statement into DuckDB-compatible form.
+    /// Transform a parsed SQL statement into target-dialect-compatible form.
     fn transpile_statement(
         &self,
         stmt: Statement,

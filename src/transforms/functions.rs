@@ -7,7 +7,7 @@ use sqlparser::ast::{
 };
 
 use crate::Result;
-use crate::dialect::SourceDialect;
+use crate::dialect::{SourceDialect, TargetDialect};
 use crate::transforms::format_strings;
 
 /// Describes how a function should be mapped from source dialect to DuckDB.
@@ -23,13 +23,19 @@ pub enum FunctionMapping {
     Custom(fn(&mut Function) -> Result<Option<Expr>>),
 }
 
-/// Build the function mapping table for the given dialect.
-pub fn function_mappings(dialect: SourceDialect) -> HashMap<&'static str, FunctionMapping> {
-    match dialect {
-        SourceDialect::Trino => trino_mappings(),
-        SourceDialect::Redshift => redshift_mappings(),
+/// Build the function mapping table for the given source/target dialect pair.
+pub fn function_mappings(
+    source: SourceDialect,
+    target: TargetDialect,
+) -> HashMap<&'static str, FunctionMapping> {
+    match (source, target) {
+        (SourceDialect::Trino, TargetDialect::DuckDB) => trino_to_duckdb_mappings(),
+        (SourceDialect::Trino, TargetDialect::DataFusion) => trino_to_datafusion_mappings(),
+        (SourceDialect::Redshift, TargetDialect::DuckDB) => redshift_to_duckdb_mappings(),
+        (SourceDialect::Redshift, TargetDialect::DataFusion) => redshift_to_datafusion_mappings(),
         // Hive functions are mostly a subset of Trino
-        SourceDialect::Hive => trino_mappings(),
+        (SourceDialect::Hive, TargetDialect::DuckDB) => trino_to_duckdb_mappings(),
+        (SourceDialect::Hive, TargetDialect::DataFusion) => trino_to_datafusion_mappings(),
     }
 }
 
@@ -37,7 +43,7 @@ pub fn function_mappings(dialect: SourceDialect) -> HashMap<&'static str, Functi
 // Trino → DuckDB
 // ---------------------------------------------------------------------------
 
-fn trino_mappings() -> HashMap<&'static str, FunctionMapping> {
+fn trino_to_duckdb_mappings() -> HashMap<&'static str, FunctionMapping> {
     HashMap::from([
         (
             "approx_distinct",
@@ -286,6 +292,412 @@ fn trino_url_extract_host(func: &mut Function) -> Result<Option<Expr>> {
     Ok(None)
 }
 
+fn trino_url_extract_host_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    // url_extract_host(url) → regexp_match(url, '://([^/:]+)')  (DataFusion version)
+    let args = extract_args(func);
+    if let Some(url_arg) = args.into_iter().next() {
+        let pattern = Expr::Value(Value::SingleQuotedString("://([^/:]+)".to_string()).into());
+        *func = make_function("regexp_match", vec![url_arg, pattern]);
+    }
+    Ok(None)
+}
+
+fn trino_to_utf8_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    // to_utf8 has no direct DataFusion equivalent
+    Err(crate::Error::Unsupported(
+        "to_utf8 is not supported for DataFusion target".to_string(),
+    ))
+}
+
+fn trino_from_utf8_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    // from_utf8 has no direct DataFusion equivalent
+    Err(crate::Error::Unsupported(
+        "from_utf8 is not supported for DataFusion target".to_string(),
+    ))
+}
+
+fn trino_map_agg_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "map_agg is not supported for DataFusion target".to_string(),
+    ))
+}
+
+fn trino_json_object_keys_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    // json_object_keys has no direct DataFusion equivalent
+    Err(crate::Error::Unsupported(
+        "json_object_keys is not supported for DataFusion target".to_string(),
+    ))
+}
+
+/// day_of_week(x) → date_part('dow', x)  (DataFusion uses date_part for day-of-week)
+fn trino_day_of_week_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if args.len() != 1 {
+        return Err(crate::Error::Unsupported(
+            "day_of_week requires exactly 1 argument".to_string(),
+        ));
+    }
+    let part = Expr::Value(Value::SingleQuotedString("dow".to_string()).into());
+    *func = make_function("date_part", vec![part, args.into_iter().next().unwrap()]);
+    Ok(None)
+}
+
+/// day_of_year(x) → date_part('doy', x)  (DataFusion uses date_part for day-of-year)
+fn trino_day_of_year_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if args.len() != 1 {
+        return Err(crate::Error::Unsupported(
+            "day_of_year requires exactly 1 argument".to_string(),
+        ));
+    }
+    let part = Expr::Value(Value::SingleQuotedString("doy".to_string()).into());
+    *func = make_function("date_part", vec![part, args.into_iter().next().unwrap()]);
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// DataFusion Unsupported stubs — functions that have no equivalent in
+// DataFusion's built-in SQL function set.
+// ---------------------------------------------------------------------------
+
+fn trino_filter_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "filter (higher-order array filter) is not supported for DataFusion target".to_string(),
+    ))
+}
+
+/// date_diff(unit, d1, d2) for DataFusion target.
+///
+/// DataFusion has no direct `date_diff` function. We implement using:
+/// - For second/minute/hour/day/week: epoch arithmetic via `to_unixtime`, truncated to BIGINT
+/// - For month/quarter/year: `date_part` arithmetic (exact calendar difference)
+///
+/// The unit argument must be a string literal at transpile time.
+fn trino_date_diff_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if args.len() != 3 {
+        return Err(crate::Error::Unsupported(
+            "date_diff requires exactly 3 arguments".to_string(),
+        ));
+    }
+    let mut args = args.into_iter();
+    let unit_arg = args.next().unwrap();
+    let d1 = args.next().unwrap();
+    let d2 = args.next().unwrap();
+
+    let unit = match &unit_arg {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => s.to_lowercase(),
+        Expr::Identifier(ident) => ident.value.to_lowercase(),
+        _ => {
+            return Err(crate::Error::Unsupported(
+                "date_diff: unit must be a string literal for DataFusion target".to_string(),
+            ));
+        }
+    };
+
+    let ts_d1 = Expr::Cast {
+        kind: sqlparser::ast::CastKind::Cast,
+        expr: Box::new(d1.clone()),
+        data_type: DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None),
+        format: None,
+        array: false,
+    };
+    let ts_d2 = Expr::Cast {
+        kind: sqlparser::ast::CastKind::Cast,
+        expr: Box::new(d2.clone()),
+        data_type: DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None),
+        format: None,
+        array: false,
+    };
+
+    let result_expr: Expr = match unit.as_str() {
+        // Epoch-based: to_unixtime(d2) - to_unixtime(d1), divided by seconds-per-unit
+        "second" | "seconds" => {
+            let epoch_diff = epoch_diff_expr(ts_d1, ts_d2);
+            cast_bigint(epoch_diff)
+        }
+        "minute" | "minutes" => {
+            let epoch_diff = epoch_diff_expr(ts_d1, ts_d2);
+            cast_bigint(div_expr(epoch_diff, 60))
+        }
+        "hour" | "hours" => {
+            let epoch_diff = epoch_diff_expr(ts_d1, ts_d2);
+            cast_bigint(div_expr(epoch_diff, 3600))
+        }
+        "day" | "days" => {
+            let epoch_diff = epoch_diff_expr(ts_d1, ts_d2);
+            cast_bigint(div_expr(epoch_diff, 86400))
+        }
+        "week" | "weeks" => {
+            let epoch_diff = epoch_diff_expr(ts_d1, ts_d2);
+            cast_bigint(div_expr(epoch_diff, 604800))
+        }
+        // date_part-based: exact calendar difference accounting for day-of-month
+        // Trino counts only complete calendar units:
+        //   date_diff('month', 1970-01-20, 1970-02-19) = 0  (day 19 < day 20 → subtract 1)
+        //   date_diff('month', 1970-01-20, 1970-02-20) = 1  (day 20 >= day 20 → no adjustment)
+        "month" | "months" => {
+            // raw = (year2 - year1) * 12 + (month2 - month1)
+            // result = raw - CASE WHEN day(d2) < day(d1) THEN 1 ELSE 0 END
+            let raw = raw_month_diff(d1.clone(), d2.clone());
+            let adj = day_lt_case(d1, d2);
+            cast_bigint(Expr::Nested(Box::new(Expr::BinaryOp {
+                left: Box::new(raw),
+                op: BinaryOperator::Minus,
+                right: Box::new(adj),
+            })))
+        }
+        "quarter" | "quarters" => {
+            // (raw_months - day_adjustment) / 3
+            let raw = raw_month_diff(d1.clone(), d2.clone());
+            let adj = day_lt_case(d1, d2);
+            let adj_months = Expr::Nested(Box::new(Expr::BinaryOp {
+                left: Box::new(raw),
+                op: BinaryOperator::Minus,
+                right: Box::new(adj),
+            }));
+            cast_bigint(div_expr(adj_months, 3))
+        }
+        "year" | "years" => {
+            // (year2 - year1) - CASE WHEN (month2, day2) < (month1, day1) THEN 1 ELSE 0 END
+            let year_diff = date_part_diff("year", d1.clone(), d2.clone());
+            let adj = month_day_lt_case(d1, d2);
+            cast_bigint(Expr::Nested(Box::new(Expr::BinaryOp {
+                left: Box::new(year_diff),
+                op: BinaryOperator::Minus,
+                right: Box::new(adj),
+            })))
+        }
+        other => {
+            return Err(crate::Error::Unsupported(format!(
+                "date_diff unit '{other}' is not supported for DataFusion target"
+            )));
+        }
+    };
+
+    Ok(Some(result_expr))
+}
+
+/// Build: to_unixtime(d2) - to_unixtime(d1)  (wrapped in Nested for precedence safety)
+fn epoch_diff_expr(ts_d1: Expr, ts_d2: Expr) -> Expr {
+    let epoch1 = Expr::Function(make_function("to_unixtime", vec![ts_d1]));
+    let epoch2 = Expr::Function(make_function("to_unixtime", vec![ts_d2]));
+    Expr::Nested(Box::new(Expr::BinaryOp {
+        left: Box::new(epoch2),
+        op: BinaryOperator::Minus,
+        right: Box::new(epoch1),
+    }))
+}
+
+/// Build: expr / divisor  (divisor as integer literal)
+fn div_expr(expr: Expr, divisor: i64) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(expr),
+        op: BinaryOperator::Divide,
+        right: Box::new(Expr::Value(
+            Value::Number(divisor.to_string(), false).into(),
+        )),
+    }
+}
+
+/// Build: CAST(expr AS BIGINT)
+fn cast_bigint(expr: Expr) -> Expr {
+    Expr::Cast {
+        kind: sqlparser::ast::CastKind::Cast,
+        expr: Box::new(expr),
+        data_type: DataType::BigInt(None),
+        format: None,
+        array: false,
+    }
+}
+
+/// Build: (year2-year1)*12 + (month2-month1)  — raw month difference (no day adjustment)
+fn raw_month_diff(d1: Expr, d2: Expr) -> Expr {
+    let year_diff = date_part_diff("year", d1.clone(), d2.clone());
+    let month_diff = date_part_diff("month", d1, d2);
+    Expr::BinaryOp {
+        left: Box::new(Expr::BinaryOp {
+            left: Box::new(year_diff),
+            op: BinaryOperator::Multiply,
+            right: Box::new(Expr::Value(Value::Number("12".to_string(), false).into())),
+        }),
+        op: BinaryOperator::Plus,
+        right: Box::new(month_diff),
+    }
+}
+
+/// Build: CASE WHEN day(d2) < day(d1) THEN 1 ELSE 0 END
+/// Used to adjust month/quarter diffs for incomplete-month boundary.
+fn day_lt_case(d1: Expr, d2: Expr) -> Expr {
+    let day_lit = Expr::Value(Value::SingleQuotedString("day".to_string()).into());
+    let day1 = Expr::Function(make_function("date_part", vec![day_lit.clone(), d1]));
+    let day2 = Expr::Function(make_function("date_part", vec![day_lit, d2]));
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![CaseWhen {
+            condition: Expr::BinaryOp {
+                left: Box::new(day2),
+                op: BinaryOperator::Lt,
+                right: Box::new(day1),
+            },
+            result: Expr::Value(Value::Number("1".to_string(), false).into()),
+        }],
+        else_result: Some(Box::new(Expr::Value(
+            Value::Number("0".to_string(), false).into(),
+        ))),
+    }
+}
+
+/// Build: CASE WHEN (month(d2), day(d2)) < (month(d1), day(d1)) THEN 1 ELSE 0 END
+/// Used to adjust year diffs for incomplete-year boundary.
+fn month_day_lt_case(d1: Expr, d2: Expr) -> Expr {
+    let month_lit = Expr::Value(Value::SingleQuotedString("month".to_string()).into());
+    let day_lit = Expr::Value(Value::SingleQuotedString("day".to_string()).into());
+    let month1 = Expr::Function(make_function(
+        "date_part",
+        vec![month_lit.clone(), d1.clone()],
+    ));
+    let month2 = Expr::Function(make_function("date_part", vec![month_lit, d2.clone()]));
+    let day1 = Expr::Function(make_function("date_part", vec![day_lit.clone(), d1]));
+    let day2 = Expr::Function(make_function("date_part", vec![day_lit, d2]));
+    // month2 < month1 OR (month2 = month1 AND day2 < day1)
+    let cond = Expr::BinaryOp {
+        left: Box::new(Expr::BinaryOp {
+            left: Box::new(month2.clone()),
+            op: BinaryOperator::Lt,
+            right: Box::new(month1.clone()),
+        }),
+        op: BinaryOperator::Or,
+        right: Box::new(Expr::Nested(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(month2),
+                op: BinaryOperator::Eq,
+                right: Box::new(month1),
+            }),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(day2),
+                op: BinaryOperator::Lt,
+                right: Box::new(day1),
+            }),
+        }))),
+    };
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![CaseWhen {
+            condition: cond,
+            result: Expr::Value(Value::Number("1".to_string(), false).into()),
+        }],
+        else_result: Some(Box::new(Expr::Value(
+            Value::Number("0".to_string(), false).into(),
+        ))),
+    }
+}
+
+/// Build: (date_part('part', d2) - date_part('part', d1))  — wrapped in Nested for precedence
+fn date_part_diff(part: &str, d1: Expr, d2: Expr) -> Expr {
+    let part_lit = Expr::Value(Value::SingleQuotedString(part.to_string()).into());
+    let dp1 = Expr::Function(make_function("date_part", vec![part_lit.clone(), d1]));
+    let dp2 = Expr::Function(make_function("date_part", vec![part_lit, d2]));
+    Expr::Nested(Box::new(Expr::BinaryOp {
+        left: Box::new(dp2),
+        op: BinaryOperator::Minus,
+        right: Box::new(dp1),
+    }))
+}
+
+fn trino_is_finite_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "is_finite is not supported for DataFusion target".to_string(),
+    ))
+}
+
+fn trino_is_infinite_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "is_infinite is not supported for DataFusion target".to_string(),
+    ))
+}
+
+fn trino_json_extract_scalar_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "json_extract_scalar is not supported for DataFusion target".to_string(),
+    ))
+}
+
+fn trino_json_extract_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "json_extract is not supported for DataFusion target".to_string(),
+    ))
+}
+
+fn trino_arbitrary_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "arbitrary (any_value) is not supported for DataFusion target".to_string(),
+    ))
+}
+
+fn trino_json_parse_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "json_parse is not supported for DataFusion target (JSON type unsupported)".to_string(),
+    ))
+}
+
+/// DATEDIFF(unit, d1, d2) for DataFusion — same strategy as Trino date_diff
+fn redshift_datediff_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    // Redshift DATEDIFF has the same signature as Trino date_diff:
+    // DATEDIFF(datepart, startdate, enddate)
+    // Reuse the Trino implementation.
+    trino_date_diff_datafusion(func)
+}
+
+fn redshift_json_extract_path_text_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "json_extract_path_text is not supported for DataFusion target".to_string(),
+    ))
+}
+
+/// months_between(d1, d2) for DataFusion.
+/// Returns (year2-year1)*12 + (month2-month1) as BIGINT.
+fn redshift_months_between_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if args.len() != 2 {
+        return Err(crate::Error::Unsupported(
+            "MONTHS_BETWEEN requires exactly 2 arguments".to_string(),
+        ));
+    }
+    let mut args = args.into_iter();
+    let date1 = args.next().unwrap();
+    let date2 = args.next().unwrap();
+
+    // (year2 - year1) * 12 + (month2 - month1)
+    let year_diff = date_part_diff("year", date1.clone(), date2.clone());
+    let month_diff = date_part_diff("month", date1, date2);
+    let expr = cast_bigint(Expr::BinaryOp {
+        left: Box::new(Expr::BinaryOp {
+            left: Box::new(year_diff),
+            op: BinaryOperator::Multiply,
+            right: Box::new(Expr::Value(Value::Number("12".to_string(), false).into())),
+        }),
+        op: BinaryOperator::Plus,
+        right: Box::new(month_diff),
+    });
+    Ok(Some(expr))
+}
+
+fn redshift_strtol_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "strtol is not supported for DataFusion target (hex string casting not supported)"
+            .to_string(),
+    ))
+}
+
 fn trino_url_extract_path(func: &mut Function) -> Result<Option<Expr>> {
     // url_extract_path(url) → regexp_extract(url, '^[^?#]+')
     let args = extract_args(func);
@@ -516,7 +928,7 @@ fn trino_bitwise_right_shift(func: &mut Function) -> Result<Option<Expr>> {
 // Redshift → DuckDB
 // ---------------------------------------------------------------------------
 
-fn redshift_mappings() -> HashMap<&'static str, FunctionMapping> {
+fn redshift_to_duckdb_mappings() -> HashMap<&'static str, FunctionMapping> {
     HashMap::from([
         ("getdate", FunctionMapping::Rename("current_timestamp")),
         ("sysdate", FunctionMapping::Rename("current_timestamp")),
@@ -604,6 +1016,500 @@ fn redshift_mappings() -> HashMap<&'static str, FunctionMapping> {
             FunctionMapping::Custom(redshift_ratio_to_report),
         ),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Trino → DataFusion
+// ---------------------------------------------------------------------------
+
+fn trino_to_datafusion_mappings() -> HashMap<&'static str, FunctionMapping> {
+    HashMap::from([
+        // Aggregate — DataFusion keeps Trino/Presto names
+        (
+            "approx_distinct",
+            FunctionMapping::Rename("approx_distinct"),
+        ),
+        (
+            "arbitrary",
+            FunctionMapping::Custom(trino_arbitrary_datafusion),
+        ),
+        // JSON — DataFusion 52 does not have JSONPath-based extraction
+        (
+            "json_extract_scalar",
+            FunctionMapping::Custom(trino_json_extract_scalar_datafusion),
+        ),
+        (
+            "json_extract",
+            FunctionMapping::Custom(trino_json_extract_datafusion),
+        ),
+        // Date/time
+        ("from_unixtime", FunctionMapping::Rename("to_timestamp")),
+        (
+            "date_parse",
+            FunctionMapping::Custom(trino_date_parse_datafusion),
+        ),
+        (
+            "format_datetime",
+            FunctionMapping::Custom(trino_format_datetime_datafusion),
+        ),
+        (
+            "date_format",
+            FunctionMapping::Custom(trino_format_datetime_datafusion),
+        ),
+        ("at_timezone", FunctionMapping::Custom(trino_at_timezone)),
+        ("with_timezone", FunctionMapping::Custom(trino_at_timezone)),
+        ("to_unixtime", FunctionMapping::Rename("to_unixtime")),
+        (
+            "parse_datetime",
+            FunctionMapping::Custom(trino_date_parse_datafusion),
+        ),
+        (
+            "current_timezone",
+            FunctionMapping::Custom(trino_current_timezone_datafusion),
+        ),
+        (
+            "date_diff",
+            FunctionMapping::Custom(trino_date_diff_datafusion),
+        ),
+        ("date_add", FunctionMapping::Rename("date_add")),
+        (
+            "day_of_week",
+            FunctionMapping::Custom(trino_day_of_week_datafusion),
+        ),
+        (
+            "day_of_year",
+            FunctionMapping::Custom(trino_day_of_year_datafusion),
+        ),
+        (
+            "week_of_year",
+            FunctionMapping::Custom(trino_week_of_year_datafusion),
+        ),
+        (
+            "year_of_week",
+            FunctionMapping::Custom(trino_year_of_week_datafusion),
+        ),
+        // Array — DataFusion uses array_* prefix natively (no renaming needed for most)
+        ("transform", FunctionMapping::Rename("array_transform")),
+        ("sequence", FunctionMapping::Rename("generate_series")),
+        ("element_at", FunctionMapping::Rename("array_element")),
+        ("cardinality", FunctionMapping::Rename("cardinality")),
+        ("array_join", FunctionMapping::Rename("array_join")),
+        ("reduce", FunctionMapping::Rename("reduce")),
+        ("filter", FunctionMapping::Custom(trino_filter_datafusion)),
+        ("contains", FunctionMapping::Rename("array_has")),
+        ("zip", FunctionMapping::Rename("zip")),
+        ("flatten", FunctionMapping::Rename("flatten")),
+        ("slice", FunctionMapping::Rename("array_slice")),
+        ("array_distinct", FunctionMapping::Rename("array_distinct")),
+        ("array_sort", FunctionMapping::Rename("array_sort")),
+        ("array_max", FunctionMapping::Rename("array_max")),
+        ("array_min", FunctionMapping::Rename("array_min")),
+        ("array_position", FunctionMapping::Rename("array_position")),
+        ("array_remove", FunctionMapping::Rename("array_filter")),
+        (
+            "array_intersect",
+            FunctionMapping::Rename("array_intersect"),
+        ),
+        ("array_concat", FunctionMapping::Rename("array_concat")),
+        ("array_except", FunctionMapping::Rename("array_except")),
+        ("array_union", FunctionMapping::Rename("array_union")),
+        (
+            "arrays_overlap",
+            FunctionMapping::Custom(trino_arrays_overlap_datafusion),
+        ),
+        ("array_sum", FunctionMapping::Rename("array_sum")),
+        ("array_average", FunctionMapping::Rename("array_avg")),
+        ("array_has", FunctionMapping::Rename("array_has")),
+        (
+            "array_has_all",
+            FunctionMapping::Custom(trino_array_has_all_datafusion),
+        ),
+        (
+            "array_has_any",
+            FunctionMapping::Custom(trino_array_has_any_datafusion),
+        ),
+        // String
+        ("split", FunctionMapping::Rename("string_to_array")),
+        (
+            "levenshtein_distance",
+            FunctionMapping::Rename("levenshtein"),
+        ),
+        ("strpos", FunctionMapping::Rename("strpos")),
+        ("length", FunctionMapping::Rename("length")),
+        ("reverse", FunctionMapping::Rename("reverse")),
+        ("lpad", FunctionMapping::Rename("lpad")),
+        ("rpad", FunctionMapping::Rename("rpad")),
+        ("chr", FunctionMapping::Rename("chr")),
+        ("codepoint", FunctionMapping::Rename("ascii")),
+        ("to_utf8", FunctionMapping::Custom(trino_to_utf8_datafusion)),
+        (
+            "from_utf8",
+            FunctionMapping::Custom(trino_from_utf8_datafusion),
+        ),
+        ("regexp_like", FunctionMapping::Rename("regexp_like")),
+        ("regexp_extract", FunctionMapping::Rename("regexp_match")),
+        ("regexp_replace", FunctionMapping::Rename("regexp_replace")),
+        // URL extraction — DataFusion also uses regexp_match
+        (
+            "url_extract_host",
+            FunctionMapping::Custom(trino_url_extract_host_datafusion),
+        ),
+        (
+            "url_extract_path",
+            FunctionMapping::Custom(trino_url_extract_path_datafusion),
+        ),
+        (
+            "url_extract_protocol",
+            FunctionMapping::Custom(trino_url_extract_protocol_datafusion),
+        ),
+        (
+            "url_extract_query",
+            FunctionMapping::Custom(trino_url_extract_query_datafusion),
+        ),
+        (
+            "url_extract_fragment",
+            FunctionMapping::Custom(trino_url_extract_fragment_datafusion),
+        ),
+        (
+            "url_extract_port",
+            FunctionMapping::Custom(trino_url_extract_port_datafusion),
+        ),
+        // Map
+        ("map_keys", FunctionMapping::Rename("map_keys")),
+        ("map_values", FunctionMapping::Rename("map_values")),
+        ("map_agg", FunctionMapping::Custom(trino_map_agg_datafusion)),
+        // JSON
+        (
+            "json_parse",
+            FunctionMapping::Custom(trino_json_parse_datafusion),
+        ),
+        ("json_format", FunctionMapping::Custom(trino_json_format)),
+        (
+            "json_array_get",
+            FunctionMapping::Custom(trino_json_array_get_datafusion),
+        ),
+        (
+            "json_object_keys",
+            FunctionMapping::Custom(trino_json_object_keys_datafusion),
+        ),
+        (
+            "json_array_length",
+            FunctionMapping::Rename("json_array_length"),
+        ),
+        // Aggregate
+        (
+            "approx_percentile",
+            FunctionMapping::Rename("approx_percentile_cont"),
+        ),
+        // Math
+        ("is_nan", FunctionMapping::Rename("isnan")),
+        (
+            "is_finite",
+            FunctionMapping::Custom(trino_is_finite_datafusion),
+        ),
+        (
+            "is_infinite",
+            FunctionMapping::Custom(trino_is_infinite_datafusion),
+        ),
+        ("nan", FunctionMapping::Custom(trino_nan)),
+        ("infinity", FunctionMapping::Custom(trino_infinity)),
+        ("typeof", FunctionMapping::Rename("arrow_typeof")),
+        // Bitwise — operators are target-agnostic
+        ("bitwise_and", FunctionMapping::Custom(trino_bitwise_and)),
+        ("bitwise_or", FunctionMapping::Custom(trino_bitwise_or)),
+        ("bitwise_xor", FunctionMapping::Custom(trino_bitwise_xor)),
+        ("bitwise_not", FunctionMapping::Custom(trino_bitwise_not)),
+        (
+            "bitwise_left_shift",
+            FunctionMapping::Custom(trino_bitwise_left_shift),
+        ),
+        (
+            "bitwise_right_shift",
+            FunctionMapping::Custom(trino_bitwise_right_shift),
+        ),
+        // Misc
+        ("from_hex", FunctionMapping::Rename("from_hex")),
+        ("rand", FunctionMapping::Rename("random")),
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Redshift → DataFusion
+// ---------------------------------------------------------------------------
+
+fn redshift_to_datafusion_mappings() -> HashMap<&'static str, FunctionMapping> {
+    HashMap::from([
+        ("getdate", FunctionMapping::Rename("now")),
+        ("sysdate", FunctionMapping::Rename("now")),
+        ("nvl", FunctionMapping::Rename("coalesce")),
+        ("nvl2", FunctionMapping::Custom(redshift_nvl2)),
+        ("decode", FunctionMapping::Custom(redshift_decode)),
+        ("listagg", FunctionMapping::Rename("string_agg")),
+        (
+            "strtol",
+            FunctionMapping::Custom(redshift_strtol_datafusion),
+        ),
+        (
+            "convert_timezone",
+            FunctionMapping::Custom(redshift_convert_timezone),
+        ),
+        ("regexp_substr", FunctionMapping::Rename("regexp_match")),
+        (
+            "regexp_count",
+            FunctionMapping::Custom(redshift_regexp_count),
+        ),
+        ("len", FunctionMapping::Rename("length")),
+        ("charindex", FunctionMapping::Custom(redshift_charindex)),
+        ("btrim", FunctionMapping::Rename("trim")),
+        (
+            "json_extract_path_text",
+            FunctionMapping::Custom(redshift_json_extract_path_text_datafusion),
+        ),
+        (
+            "json_extract_array_element_text",
+            FunctionMapping::Custom(redshift_json_extract_array_element),
+        ),
+        ("bpcharcmp", FunctionMapping::Custom(redshift_unsupported)),
+        ("dateadd", FunctionMapping::Custom(redshift_dateadd)),
+        (
+            "datediff",
+            FunctionMapping::Custom(redshift_datediff_datafusion),
+        ),
+        (
+            "date_trunc",
+            FunctionMapping::Custom(redshift_quote_first_arg),
+        ),
+        (
+            "date_part",
+            FunctionMapping::Custom(redshift_quote_first_arg),
+        ),
+        // DataFusion has to_char with PostgreSQL format strings — no format conversion needed
+        ("to_char", FunctionMapping::Rename("to_char")),
+        ("to_date", FunctionMapping::Rename("to_date")),
+        ("to_timestamp", FunctionMapping::Rename("to_timestamp")),
+        ("trim", FunctionMapping::Rename("trim")),
+        ("replace", FunctionMapping::Rename("replace")),
+        ("upper", FunctionMapping::Rename("upper")),
+        ("lower", FunctionMapping::Rename("lower")),
+        ("left", FunctionMapping::Rename("left")),
+        ("right", FunctionMapping::Rename("right")),
+        ("substring", FunctionMapping::Rename("substring")),
+        ("md5", FunctionMapping::Rename("md5")),
+        ("sha1", FunctionMapping::Rename("sha1")),
+        ("lcase", FunctionMapping::Rename("lower")),
+        ("ucase", FunctionMapping::Rename("upper")),
+        ("is_valid_json", FunctionMapping::Rename("is_valid_json")),
+        ("isnull", FunctionMapping::Custom(redshift_isnull)),
+        ("space", FunctionMapping::Custom(redshift_space)),
+        ("sha2", FunctionMapping::Custom(redshift_sha2)),
+        // JSON
+        ("json_typeof", FunctionMapping::Rename("json_typeof")),
+        (
+            "json_serialize",
+            FunctionMapping::Custom(redshift_json_serialize),
+        ),
+        (
+            "json_deserialize",
+            FunctionMapping::Custom(redshift_json_deserialize),
+        ),
+        (
+            "json_array_length",
+            FunctionMapping::Rename("json_array_length"),
+        ),
+        // Array — DataFusion uses array_concat, not list_concat
+        ("array_concat", FunctionMapping::Rename("array_concat")),
+        // Additional mappings
+        (
+            "months_between",
+            FunctionMapping::Custom(redshift_months_between_datafusion),
+        ),
+        ("add_months", FunctionMapping::Custom(redshift_add_months)),
+        (
+            "ratio_to_report",
+            FunctionMapping::Custom(redshift_ratio_to_report),
+        ),
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// DataFusion-specific custom handlers
+// ---------------------------------------------------------------------------
+
+/// date_parse(str, fmt) → to_timestamp(str, converted_fmt)
+/// DataFusion uses to_timestamp() for parsing date strings.
+fn trino_date_parse_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    set_function_name(func, "to_timestamp");
+    convert_format_arg_trino(func, 1);
+    Ok(None)
+}
+
+/// format_datetime(ts, fmt) → to_char(ts, converted_fmt)
+/// DataFusion uses to_char() for formatting timestamps.
+fn trino_format_datetime_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    set_function_name(func, "to_char");
+    convert_format_arg_trino(func, 1);
+    Ok(None)
+}
+
+/// current_timezone() → not supported in DataFusion
+fn trino_current_timezone_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    Err(crate::Error::Unsupported(
+        "current_timezone() has no DataFusion equivalent".to_string(),
+    ))
+}
+
+/// week_of_year(x) → date_part('week', x)
+fn trino_week_of_year_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if args.len() != 1 {
+        return Err(crate::Error::Unsupported(
+            "week_of_year requires exactly 1 argument".to_string(),
+        ));
+    }
+    let date_expr = args.into_iter().next().unwrap();
+    let part = Expr::Value(Value::SingleQuotedString("week".to_string()).into());
+    *func = make_function("date_part", vec![part, date_expr]);
+    Ok(None)
+}
+
+/// year_of_week(x) → date_part('year', date_trunc('week', x))
+fn trino_year_of_week_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if args.len() != 1 {
+        return Err(crate::Error::Unsupported(
+            "year_of_week requires exactly 1 argument".to_string(),
+        ));
+    }
+    let date_expr = args.into_iter().next().unwrap();
+    let week_lit = Expr::Value(Value::SingleQuotedString("week".to_string()).into());
+    let truncated = Expr::Function(make_function("date_trunc", vec![week_lit, date_expr]));
+    let year_lit = Expr::Value(Value::SingleQuotedString("year".to_string()).into());
+    *func = make_function("date_part", vec![year_lit, truncated]);
+    Ok(None)
+}
+
+/// arrays_overlap(a, b) → array_length(array_intersect(a, b)) > 0
+fn trino_arrays_overlap_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if args.len() != 2 {
+        return Err(crate::Error::Unsupported(
+            "arrays_overlap requires exactly 2 arguments".to_string(),
+        ));
+    }
+    let mut args = args.into_iter();
+    let a = args.next().unwrap();
+    let b = args.next().unwrap();
+    let intersect = Expr::Function(make_function("array_intersect", vec![a, b]));
+    let len = Expr::Function(make_function("array_length", vec![intersect]));
+    Ok(Some(Expr::BinaryOp {
+        left: Box::new(len),
+        op: BinaryOperator::Gt,
+        right: Box::new(Expr::Value(Value::Number("0".to_string(), false).into())),
+    }))
+}
+
+/// array_has_all(arr, candidates) → array_length(array_intersect(arr, candidates)) = array_length(candidates)
+fn trino_array_has_all_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if args.len() != 2 {
+        return Err(crate::Error::Unsupported(
+            "array_has_all requires exactly 2 arguments".to_string(),
+        ));
+    }
+    let mut args = args.into_iter();
+    let arr = args.next().unwrap();
+    let candidates = args.next().unwrap();
+    let intersect = Expr::Function(make_function(
+        "array_intersect",
+        vec![arr, candidates.clone()],
+    ));
+    let intersect_len = Expr::Function(make_function("array_length", vec![intersect]));
+    let candidates_len = Expr::Function(make_function("array_length", vec![candidates]));
+    Ok(Some(Expr::BinaryOp {
+        left: Box::new(intersect_len),
+        op: BinaryOperator::Eq,
+        right: Box::new(candidates_len),
+    }))
+}
+
+/// array_has_any(arr, candidates) → array_length(array_intersect(arr, candidates)) > 0
+fn trino_array_has_any_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if args.len() != 2 {
+        return Err(crate::Error::Unsupported(
+            "array_has_any requires exactly 2 arguments".to_string(),
+        ));
+    }
+    let mut args = args.into_iter();
+    let arr = args.next().unwrap();
+    let candidates = args.next().unwrap();
+    let intersect = Expr::Function(make_function("array_intersect", vec![arr, candidates]));
+    let len = Expr::Function(make_function("array_length", vec![intersect]));
+    Ok(Some(Expr::BinaryOp {
+        left: Box::new(len),
+        op: BinaryOperator::Gt,
+        right: Box::new(Expr::Value(Value::Number("0".to_string(), false).into())),
+    }))
+}
+
+fn trino_json_array_get_datafusion(_func: &mut Function) -> Result<Option<Expr>> {
+    // json_array_get requires json_extract_scalar which is not available in DataFusion 52
+    Err(crate::Error::Unsupported(
+        "json_array_get is not supported for DataFusion target".to_string(),
+    ))
+}
+
+/// url_extract_path(url) → regexp_match(url, '^[^?#]+')  (DataFusion version)
+fn trino_url_extract_path_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if let Some(url_arg) = args.into_iter().next() {
+        let pattern = Expr::Value(Value::SingleQuotedString("^[^?#]+".to_string()).into());
+        *func = make_function("regexp_match", vec![url_arg, pattern]);
+    }
+    Ok(None)
+}
+
+/// url_extract_protocol(url) → regexp_match(...) (DataFusion version)
+fn trino_url_extract_protocol_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if let Some(url_arg) = args.into_iter().next() {
+        let pattern = Expr::Value(
+            Value::SingleQuotedString("^([a-zA-Z][a-zA-Z0-9+\\-.]*)://".to_string()).into(),
+        );
+        *func = make_function("regexp_match", vec![url_arg, pattern]);
+    }
+    Ok(None)
+}
+
+/// url_extract_query(url) → regexp_match(...) (DataFusion version)
+fn trino_url_extract_query_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if let Some(url_arg) = args.into_iter().next() {
+        let pattern = Expr::Value(Value::SingleQuotedString("[?]([^#]*)".to_string()).into());
+        *func = make_function("regexp_match", vec![url_arg, pattern]);
+    }
+    Ok(None)
+}
+
+/// url_extract_fragment(url) → regexp_match(...) (DataFusion version)
+fn trino_url_extract_fragment_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if let Some(url_arg) = args.into_iter().next() {
+        let pattern = Expr::Value(Value::SingleQuotedString("#(.*)".to_string()).into());
+        *func = make_function("regexp_match", vec![url_arg, pattern]);
+    }
+    Ok(None)
+}
+
+/// url_extract_port(url) → regexp_match(...) (DataFusion version)
+fn trino_url_extract_port_datafusion(func: &mut Function) -> Result<Option<Expr>> {
+    let args = extract_args(func);
+    if let Some(url_arg) = args.into_iter().next() {
+        let pattern =
+            Expr::Value(Value::SingleQuotedString("://[^/?#]*:([0-9]+)".to_string()).into());
+        *func = make_function("regexp_match", vec![url_arg, pattern]);
+    }
+    Ok(None)
 }
 
 /// NVL2(expr, val_if_not_null, val_if_null) → CASE WHEN expr IS NOT NULL THEN ... ELSE ... END

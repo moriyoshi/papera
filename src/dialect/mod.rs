@@ -13,3 +13,13 @@ pub enum SourceDialect {
     Redshift,
     Hive,
 }
+
+/// The target SQL dialect to transpile to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TargetDialect {
+    /// Apache DuckDB (default).
+    #[default]
+    DuckDB,
+    /// Apache DataFusion.
+    DataFusion,
+}
