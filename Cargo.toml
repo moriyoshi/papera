@@ -1,0 +1,28 @@
+[package]
+name = "papera"
+version = "0.1.0"
+edition = "2024"
+description = "A SQL compatibility layer that transpiles Trino and Redshift SQL to DuckDB SQL"
+license = "MIT"
+keywords = ["sql", "transpiler", "duckdb", "trino", "redshift"]
+categories = ["database"]
+
+[lib]
+name = "papera"
+path = "src/lib.rs"
+
+[[bin]]
+name = "papera"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+cli = []
+
+[dependencies]
+sqlparser = { version = "0.61", features = ["visitor"] }
+thiserror = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+duckdb = { version = "1", features = ["bundled"] }
