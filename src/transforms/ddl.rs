@@ -6,7 +6,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::dialect::SourceDialect;
+use crate::dialect::{SourceDialect, TargetDialect};
 use crate::transforms::types;
 use crate::{ExternalTableBehavior, IcebergTableBehavior, Result, TranspileOptions};
 
@@ -29,12 +29,12 @@ pub fn rewrite_ddl(
                 return rewrite_trino_s3_table(stmt, dialect, opts);
             }
             for col in ct.columns.iter_mut() {
-                types::rewrite_data_type(&mut col.data_type, dialect)?;
+                types::rewrite_data_type(&mut col.data_type, dialect, opts.target)?;
             }
         }
         Statement::AlterTable(alter) => {
             for op in alter.operations.iter_mut() {
-                rewrite_alter_operation(op, dialect)?;
+                rewrite_alter_operation(op, dialect, opts.target)?;
             }
         }
         _ => {}
@@ -150,13 +150,14 @@ fn rewrite_iceberg_table(
              Set IcebergTableBehavior::MapToView to convert to a DuckDB view using iceberg_scan().",
             ct.name,
         ))),
-        IcebergTableBehavior::MapToView => iceberg_table_to_view(ct, dialect),
+        IcebergTableBehavior::MapToView => iceberg_table_to_view(ct, dialect, opts.target),
     }
 }
 
 fn iceberg_table_to_view(
     mut ct: sqlparser::ast::CreateTable,
     dialect: SourceDialect,
+    target: TargetDialect,
 ) -> Result<Statement> {
     // Extract location from:
     // 1. CreateTable.location (Athena: LOCATION 'path')
@@ -177,7 +178,7 @@ fn iceberg_table_to_view(
 
     // Rewrite column types
     for col in ct.columns.iter_mut() {
-        types::rewrite_data_type(&mut col.data_type, dialect)?;
+        types::rewrite_data_type(&mut col.data_type, dialect, target)?;
     }
 
     let columns: Vec<ViewColumnDef> = ct
@@ -271,7 +272,7 @@ fn external_table_to_view(
     let reader_opts = build_reader_options(&ct.hive_formats, &ct.hive_distribution);
 
     for col in ct.columns.iter_mut() {
-        types::rewrite_data_type(&mut col.data_type, dialect)?;
+        types::rewrite_data_type(&mut col.data_type, dialect, opts.target)?;
     }
 
     let columns: Vec<ViewColumnDef> = ct
@@ -342,13 +343,14 @@ fn rewrite_trino_s3_table(
              Set ExternalTableBehavior::MapToView to convert to a DuckDB view.",
             ct.name,
         ))),
-        ExternalTableBehavior::MapToView => trino_s3_table_to_view(ct, dialect),
+        ExternalTableBehavior::MapToView => trino_s3_table_to_view(ct, dialect, opts.target),
     }
 }
 
 fn trino_s3_table_to_view(
     mut ct: sqlparser::ast::CreateTable,
     dialect: SourceDialect,
+    target: TargetDialect,
 ) -> Result<Statement> {
     let opts = extract_table_options(&ct.table_options);
 
@@ -368,7 +370,7 @@ fn trino_s3_table_to_view(
     let reader_fn = reader_from_trino_format(&format)?;
 
     for col in ct.columns.iter_mut() {
-        types::rewrite_data_type(&mut col.data_type, dialect)?;
+        types::rewrite_data_type(&mut col.data_type, dialect, target)?;
     }
 
     let columns: Vec<ViewColumnDef> = ct
@@ -574,16 +576,20 @@ fn infer_reader_from_serde_class(class: &str) -> Result<String> {
 // ALTER TABLE
 // ---------------------------------------------------------------------------
 
-fn rewrite_alter_operation(op: &mut AlterTableOperation, dialect: SourceDialect) -> Result<()> {
+fn rewrite_alter_operation(
+    op: &mut AlterTableOperation,
+    dialect: SourceDialect,
+    target: TargetDialect,
+) -> Result<()> {
     match op {
         AlterTableOperation::AddColumn { column_def, .. } => {
-            types::rewrite_data_type(&mut column_def.data_type, dialect)?;
+            types::rewrite_data_type(&mut column_def.data_type, dialect, target)?;
         }
         AlterTableOperation::AlterColumn {
             op: sqlparser::ast::AlterColumnOperation::SetDataType { data_type, .. },
             ..
         } => {
-            types::rewrite_data_type(data_type, dialect)?;
+            types::rewrite_data_type(data_type, dialect, target)?;
         }
         _ => {}
     }

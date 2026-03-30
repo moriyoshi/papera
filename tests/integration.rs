@@ -1,6 +1,6 @@
 mod common;
 
-use papera::dialect::SourceDialect;
+use papera::dialect::{SourceDialect, TargetDialect};
 use papera::{
     CopyBehavior, ExternalTableBehavior, IcebergTableBehavior, SerdeClassResolver, TranspileOptions,
 };
@@ -629,4 +629,1146 @@ fn redshift_isnull_lcase_ucase() {
     assert!(result.contains("coalesce"), "ISNULL: {result}");
     assert!(result.contains("lower"), "LCASE: {result}");
     assert!(result.contains("upper"), "UCASE: {result}");
+}
+
+// ---------------------------------------------------------------------------
+// DataFusion target tests
+// ---------------------------------------------------------------------------
+
+fn datafusion_opts() -> TranspileOptions {
+    TranspileOptions {
+        target: TargetDialect::DataFusion,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn trino_to_datafusion_passthrough_functions() {
+    // Functions that share the same name in Trino and DataFusion should not be renamed
+    let sql = "SELECT approx_distinct(user_id), cardinality(arr), array_join(arr, ',') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("approx_distinct"),
+        "approx_distinct should pass through: {result}"
+    );
+    assert!(
+        !result.contains("approx_count_distinct"),
+        "should not rename to DuckDB name: {result}"
+    );
+    assert!(
+        result.contains("cardinality"),
+        "cardinality should pass through: {result}"
+    );
+    assert!(
+        !result.contains("len("),
+        "should not rename to DuckDB len: {result}"
+    );
+    assert!(
+        result.contains("array_join"),
+        "array_join should pass through: {result}"
+    );
+    assert!(
+        !result.contains("array_to_string"),
+        "should not rename to DuckDB array_to_string: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_array_functions() {
+    // filter is not supported for DataFusion target
+    let filter_err = papera::transpile_with_options(
+        "SELECT filter(arr, x -> x > 0) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    );
+    assert!(
+        filter_err.is_err(),
+        "filter should be Unsupported for DataFusion target"
+    );
+
+    // transform and contains are supported
+    let sql = "SELECT transform(arr, x -> x * 2), contains(arr, 1) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("array_transform"),
+        "transform → array_transform: {result}"
+    );
+    assert!(
+        result.contains("array_has"),
+        "contains → array_has: {result}"
+    );
+    assert!(
+        !result.contains("list_filter"),
+        "no DuckDB list_filter: {result}"
+    );
+    assert!(
+        !result.contains("list_transform"),
+        "no DuckDB list_transform: {result}"
+    );
+    assert!(
+        !result.contains("list_contains"),
+        "no DuckDB list_contains: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_more_array_functions() {
+    let sql = "SELECT element_at(arr, 1), slice(arr, 1, 3), array_distinct(arr) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("array_element"),
+        "element_at → array_element: {result}"
+    );
+    assert!(
+        result.contains("array_slice"),
+        "slice → array_slice: {result}"
+    );
+    assert!(
+        result.contains("array_distinct"),
+        "array_distinct passes through: {result}"
+    );
+    assert!(
+        !result.contains("list_extract"),
+        "no DuckDB list_extract: {result}"
+    );
+    assert!(
+        !result.contains("list_slice"),
+        "no DuckDB list_slice: {result}"
+    );
+    assert!(
+        !result.contains("list_distinct"),
+        "no DuckDB list_distinct: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_type_varbinary() {
+    let sql = "CREATE TABLE t (a VARBINARY, b INTEGER)";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(result.contains("BYTEA"), "VARBINARY → BYTEA: {result}");
+    assert!(!result.contains("BLOB"), "no DuckDB BLOB: {result}");
+}
+
+#[test]
+fn trino_to_datafusion_cast_varbinary() {
+    let sql = "SELECT CAST(col AS VARBINARY) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(result.contains("BYTEA"), "CAST VARBINARY → BYTEA: {result}");
+}
+
+#[test]
+fn trino_to_datafusion_array_union_simple_rename() {
+    // For DataFusion, array_union is available natively — no complex rewrite needed
+    let sql = "SELECT array_union(a, b) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("array_union"),
+        "array_union passes through: {result}"
+    );
+    assert!(
+        !result.contains("list_distinct"),
+        "no DuckDB list_distinct wrapping: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_approx_percentile() {
+    let sql = "SELECT approx_percentile(col, 0.95) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("approx_percentile_cont"),
+        "approx_percentile → approx_percentile_cont: {result}"
+    );
+    assert!(
+        !result.contains("approx_quantile"),
+        "no DuckDB approx_quantile: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_regexp_functions() {
+    let sql = "SELECT regexp_like(s, 'a+'), split(s, ',') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("regexp_like"),
+        "regexp_like passes through: {result}"
+    );
+    assert!(
+        !result.contains("regexp_matches"),
+        "no DuckDB regexp_matches: {result}"
+    );
+    assert!(
+        result.contains("string_to_array"),
+        "split → string_to_array: {result}"
+    );
+    assert!(
+        !result.contains("str_split"),
+        "no DuckDB str_split: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_format_datetime() {
+    let sql = "SELECT format_datetime(ts, 'yyyy-MM-dd') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("to_char"),
+        "format_datetime → to_char: {result}"
+    );
+    assert!(!result.contains("strftime"), "no DuckDB strftime: {result}");
+}
+
+#[test]
+fn trino_to_datafusion_date_parse() {
+    let sql = "SELECT date_parse(s, 'yyyy-MM-dd') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("to_timestamp"),
+        "date_parse → to_timestamp: {result}"
+    );
+    assert!(!result.contains("strptime"), "no DuckDB strptime: {result}");
+}
+
+#[test]
+fn trino_to_datafusion_typeof() {
+    let sql = "SELECT typeof(col) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("arrow_typeof"),
+        "typeof → arrow_typeof: {result}"
+    );
+}
+
+#[test]
+fn hive_to_datafusion_array_functions() {
+    // Hive shares mapping with Trino; verify DataFusion target works
+    let sql = "SELECT array_sort(arr), array_max(arr) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Hive, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("array_sort"),
+        "array_sort passes through: {result}"
+    );
+    assert!(
+        result.contains("array_max"),
+        "array_max passes through: {result}"
+    );
+    assert!(
+        !result.contains("list_sort"),
+        "no DuckDB list_sort: {result}"
+    );
+    assert!(!result.contains("list_max"), "no DuckDB list_max: {result}");
+}
+
+#[test]
+fn redshift_to_datafusion_basic_functions() {
+    let sql = "SELECT NVL(a, b), LEN(s), CHARINDEX('@', email) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(result.contains("coalesce"), "NVL → coalesce: {result}");
+    assert!(result.contains("length"), "LEN → length: {result}");
+    assert!(result.contains("strpos"), "CHARINDEX → strpos: {result}");
+}
+
+#[test]
+fn redshift_to_datafusion_type_super() {
+    let sql = "CREATE TABLE t (data SUPER, name VARCHAR(MAX))";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(
+        !result.contains("JSON"),
+        "SUPER should not become JSON for DataFusion: {result}"
+    );
+    assert!(
+        result.contains("VARCHAR"),
+        "SUPER → VARCHAR for DataFusion: {result}"
+    );
+}
+
+#[test]
+fn redshift_to_datafusion_array_concat() {
+    // For DataFusion, array_concat maps to array_concat (not list_concat)
+    let sql = "SELECT array_concat(a, b) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("array_concat"),
+        "array_concat passes through for DataFusion: {result}"
+    );
+    assert!(
+        !result.contains("list_concat"),
+        "no DuckDB list_concat: {result}"
+    );
+}
+
+#[test]
+fn duckdb_target_backward_compatible() {
+    // Default target is DuckDB — existing behavior unchanged
+    let sql = "SELECT approx_distinct(x), contains(arr, 1) FROM t";
+    let result = papera::transpile(sql, SourceDialect::Trino).unwrap();
+    assert!(
+        result.contains("approx_count_distinct"),
+        "DuckDB default: approx_count_distinct: {result}"
+    );
+    assert!(
+        result.contains("list_contains"),
+        "DuckDB default: list_contains: {result}"
+    );
+}
+
+#[test]
+fn datafusion_show_create_table_error() {
+    let sql = "SHOW CREATE TABLE t";
+    let result = papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts());
+    assert!(
+        result.is_err(),
+        "SHOW CREATE TABLE should error for DataFusion target"
+    );
+}
+
+#[test]
+fn datafusion_url_extract_host_uses_regexp_match() {
+    let sql = "SELECT url_extract_host(url) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("regexp_match"),
+        "url_extract_host for DataFusion should use regexp_match, got: {result}"
+    );
+    assert!(
+        !result.contains("regexp_extract"),
+        "url_extract_host for DataFusion must not emit regexp_extract (DuckDB name), got: {result}"
+    );
+}
+
+#[test]
+fn datafusion_to_utf8_unsupported() {
+    let sql = "SELECT to_utf8(s) FROM t";
+    let result = papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts());
+    assert!(
+        result.is_err(),
+        "to_utf8 should be Unsupported for DataFusion target"
+    );
+}
+
+#[test]
+fn datafusion_from_utf8_unsupported() {
+    let sql = "SELECT from_utf8(b) FROM t";
+    let result = papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts());
+    assert!(
+        result.is_err(),
+        "from_utf8 should be Unsupported for DataFusion target"
+    );
+}
+
+#[test]
+fn datafusion_map_agg_unsupported() {
+    // map_agg is not available in DataFusion 52
+    let sql = "SELECT map_agg(k, v) FROM t";
+    let result = papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts());
+    assert!(
+        result.is_err(),
+        "map_agg should be Unsupported for DataFusion target"
+    );
+}
+
+#[test]
+fn datafusion_json_object_keys_unsupported() {
+    let sql = "SELECT json_object_keys(j) FROM t";
+    let result = papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts());
+    assert!(
+        result.is_err(),
+        "json_object_keys should be Unsupported for DataFusion target"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trino → DataFusion: date/time functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trino_to_datafusion_from_unixtime() {
+    let sql = "SELECT from_unixtime(ts) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("to_timestamp"),
+        "from_unixtime → to_timestamp: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_at_timezone() {
+    let sql = "SELECT at_timezone(ts, 'UTC') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("AT TIME ZONE"),
+        "at_timezone → AT TIME ZONE: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_current_timezone_unsupported() {
+    let sql = "SELECT current_timezone() FROM t";
+    let result = papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts());
+    assert!(
+        result.is_err(),
+        "current_timezone() should be Unsupported for DataFusion target"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_date_diff_and_add() {
+    // date_diff('day', d1, d2) → epoch arithmetic via to_unixtime
+    let result = papera::transpile_with_options(
+        "SELECT date_diff('day', d1, d2) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(
+        result.contains("to_unixtime"),
+        "date_diff('day') → epoch arithmetic: {result}"
+    );
+    assert!(
+        result.contains("86400"),
+        "date_diff('day') divides by 86400: {result}"
+    );
+
+    // date_diff('month', ...) → date_part arithmetic
+    let month_result = papera::transpile_with_options(
+        "SELECT date_diff('month', d1, d2) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(
+        month_result.contains("date_part"),
+        "date_diff('month') → date_part arithmetic: {month_result}"
+    );
+
+    // date_add passes through
+    let add_result = papera::transpile_with_options(
+        "SELECT date_add('month', 1, d) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(
+        add_result.contains("date_add"),
+        "date_add passthrough: {add_result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_day_of_week_and_year() {
+    let sql = "SELECT day_of_week(d), day_of_year(d) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    // day_of_week → date_part('dow', d) for DataFusion
+    assert!(
+        result.contains("date_part") && result.contains("'dow'"),
+        "day_of_week → date_part('dow', ...): {result}"
+    );
+    // day_of_year → date_part('doy', d) for DataFusion
+    assert!(
+        result.contains("date_part") && result.contains("'doy'"),
+        "day_of_year → date_part('doy', ...): {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_week_of_year() {
+    let sql = "SELECT week_of_year(d) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("date_part"),
+        "week_of_year → date_part: {result}"
+    );
+    assert!(
+        result.contains("'week'"),
+        "week_of_year: date_part('week', ...): {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_year_of_week() {
+    let sql = "SELECT year_of_week(d) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("date_part"),
+        "year_of_week → date_part: {result}"
+    );
+    assert!(
+        result.contains("date_trunc"),
+        "year_of_week uses date_trunc: {result}"
+    );
+    assert!(
+        result.contains("'year'"),
+        "year_of_week extracts year: {result}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trino → DataFusion: string functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trino_to_datafusion_string_functions() {
+    let sql = "SELECT levenshtein_distance(a, b), strpos(s, 'x'), length(s), reverse(s) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("levenshtein"),
+        "levenshtein_distance → levenshtein: {result}"
+    );
+    assert!(result.contains("strpos"), "strpos passthrough: {result}");
+    assert!(result.contains("length"), "length passthrough: {result}");
+    assert!(result.contains("reverse"), "reverse passthrough: {result}");
+}
+
+#[test]
+fn trino_to_datafusion_pad_functions() {
+    let sql = "SELECT lpad(s, 5, '0'), rpad(s, 5, ' '), chr(65), codepoint('A') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(result.contains("lpad"), "lpad passthrough: {result}");
+    assert!(result.contains("rpad"), "rpad passthrough: {result}");
+    assert!(result.contains("chr"), "chr passthrough: {result}");
+    assert!(result.contains("ascii"), "codepoint → ascii: {result}");
+}
+
+#[test]
+fn trino_to_datafusion_regexp_extract() {
+    let sql = "SELECT regexp_extract(s, '[0-9]+') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("regexp_match"),
+        "regexp_extract → regexp_match: {result}"
+    );
+    assert!(
+        !result.contains("regexp_extract"),
+        "must not keep regexp_extract: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_regexp_replace() {
+    let sql = "SELECT regexp_replace(s, '[0-9]+', 'N') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("regexp_replace"),
+        "regexp_replace passthrough: {result}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trino → DataFusion: additional array functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trino_to_datafusion_array_sequence_and_zip() {
+    let sql = "SELECT sequence(1, 10), zip(a, b) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("generate_series"),
+        "sequence → generate_series: {result}"
+    );
+    assert!(result.contains("zip"), "zip passthrough: {result}");
+}
+
+#[test]
+fn trino_to_datafusion_array_set_operations() {
+    let sql = "SELECT array_intersect(a, b), array_except(a, b), array_concat(a, b) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("array_intersect"),
+        "array_intersect passthrough: {result}"
+    );
+    assert!(
+        result.contains("array_except"),
+        "array_except passthrough: {result}"
+    );
+    assert!(
+        result.contains("array_concat"),
+        "array_concat passthrough: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_arrays_overlap() {
+    let sql = "SELECT arrays_overlap(a, b) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("array_intersect"),
+        "arrays_overlap uses array_intersect: {result}"
+    );
+    assert!(
+        result.contains("array_length"),
+        "arrays_overlap uses array_length: {result}"
+    );
+    assert!(
+        result.contains("> 0"),
+        "arrays_overlap checks > 0: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_array_has_all_and_any() {
+    let r_all = papera::transpile_with_options(
+        "SELECT array_has_all(a, b) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(
+        r_all.contains("array_intersect"),
+        "array_has_all uses array_intersect: {r_all}"
+    );
+    assert!(
+        r_all.contains("array_length"),
+        "array_has_all uses array_length: {r_all}"
+    );
+
+    let r_any = papera::transpile_with_options(
+        "SELECT array_has_any(a, b) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(
+        r_any.contains("array_intersect"),
+        "array_has_any uses array_intersect: {r_any}"
+    );
+    assert!(r_any.contains("> 0"), "array_has_any checks > 0: {r_any}");
+}
+
+#[test]
+fn trino_to_datafusion_array_aggregates() {
+    let sql = "SELECT array_sum(a), array_average(a), array_has(a, 1) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("array_sum"),
+        "array_sum passthrough: {result}"
+    );
+    assert!(
+        result.contains("array_avg"),
+        "array_average → array_avg: {result}"
+    );
+    assert!(
+        result.contains("array_has"),
+        "array_has passthrough: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_array_position_and_remove() {
+    let sql = "SELECT array_position(arr, 3), flatten(arr) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("array_position"),
+        "array_position passthrough: {result}"
+    );
+    assert!(result.contains("flatten"), "flatten passthrough: {result}");
+}
+
+// ---------------------------------------------------------------------------
+// Trino → DataFusion: URL extraction remaining functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trino_to_datafusion_url_extraction_remaining() {
+    let cases = [
+        ("SELECT url_extract_path(url) FROM t", "regexp_match"),
+        ("SELECT url_extract_protocol(url) FROM t", "regexp_match"),
+        ("SELECT url_extract_query(url) FROM t", "regexp_match"),
+        ("SELECT url_extract_fragment(url) FROM t", "regexp_match"),
+        ("SELECT url_extract_port(url) FROM t", "regexp_match"),
+    ];
+    for (sql, expected) in &cases {
+        let result =
+            papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+        assert!(
+            result.contains(expected),
+            "{sql}: expected {expected} in: {result}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trino → DataFusion: JSON functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trino_to_datafusion_json_functions() {
+    // json_extract_scalar is not supported for DataFusion target
+    let scalar_err = papera::transpile_with_options(
+        "SELECT json_extract_scalar(j, '$.k') FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    );
+    assert!(
+        scalar_err.is_err(),
+        "json_extract_scalar should be Unsupported for DataFusion target"
+    );
+
+    // json_extract is also not supported for DataFusion target
+    let extract_err = papera::transpile_with_options(
+        "SELECT json_extract(j, '$.k') FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    );
+    assert!(
+        extract_err.is_err(),
+        "json_extract should be Unsupported for DataFusion target"
+    );
+
+    // json_array_length passes through
+    let result = papera::transpile_with_options(
+        "SELECT json_array_length(j) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(
+        result.contains("json_array_length"),
+        "json_array_length passthrough: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_json_parse_and_format() {
+    // json_parse is not supported for DataFusion target (no JSON type)
+    let parse_err = papera::transpile_with_options(
+        "SELECT json_parse(s) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    );
+    assert!(
+        parse_err.is_err(),
+        "json_parse should be Unsupported for DataFusion target"
+    );
+
+    // json_format still casts to VARCHAR (passthrough)
+    let format_result = papera::transpile_with_options(
+        "SELECT json_format(j) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(
+        format_result.contains("CAST"),
+        "json_format → CAST: {format_result}"
+    );
+    assert!(
+        format_result.contains("VARCHAR"),
+        "json_format → CAST AS VARCHAR: {format_result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_json_array_get() {
+    // json_array_get requires json_extract_scalar which is not available in DataFusion 52
+    let result = papera::transpile_with_options(
+        "SELECT json_array_get(j, 2) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    );
+    assert!(
+        result.is_err(),
+        "json_array_get should be Unsupported for DataFusion target"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trino → DataFusion: math functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trino_to_datafusion_math_functions() {
+    // is_nan passes through as isnan
+    let result = papera::transpile_with_options(
+        "SELECT is_nan(x) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(result.contains("isnan"), "is_nan → isnan: {result}");
+
+    // is_finite and is_infinite are not available in DataFusion 52
+    let finite_err = papera::transpile_with_options(
+        "SELECT is_finite(x) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    );
+    assert!(
+        finite_err.is_err(),
+        "is_finite should be Unsupported for DataFusion target"
+    );
+
+    let infinite_err = papera::transpile_with_options(
+        "SELECT is_infinite(x) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    );
+    assert!(
+        infinite_err.is_err(),
+        "is_infinite should be Unsupported for DataFusion target"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_misc_functions() {
+    let sql = "SELECT from_hex(h), rand() FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("from_hex"),
+        "from_hex passthrough: {result}"
+    );
+    assert!(result.contains("random"), "rand → random: {result}");
+}
+
+#[test]
+fn trino_to_datafusion_map_functions() {
+    let sql = "SELECT map_keys(m), map_values(m) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("map_keys"),
+        "map_keys passthrough: {result}"
+    );
+    assert!(
+        result.contains("map_values"),
+        "map_values passthrough: {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_aggregate_arbitrary() {
+    // arbitrary (any_value) is not available in DataFusion 52
+    let result = papera::transpile_with_options(
+        "SELECT arbitrary(col) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    );
+    assert!(
+        result.is_err(),
+        "arbitrary should be Unsupported for DataFusion target"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trino → DataFusion: bitwise functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trino_to_datafusion_bitwise_functions() {
+    let cases = [
+        ("SELECT bitwise_and(a, b) FROM t", "&"),
+        ("SELECT bitwise_or(a, b) FROM t", "|"),
+        ("SELECT bitwise_xor(a, b) FROM t", "^"),
+    ];
+    for (sql, expected_op) in &cases {
+        let result =
+            papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+        assert!(
+            result.contains(expected_op),
+            "{sql}: expected op '{expected_op}' in: {result}"
+        );
+    }
+}
+
+#[test]
+fn trino_to_datafusion_bitwise_shifts() {
+    let left = papera::transpile_with_options(
+        "SELECT bitwise_left_shift(a, 2) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(left.contains("<<"), "bitwise_left_shift → <<: {left}");
+
+    let right = papera::transpile_with_options(
+        "SELECT bitwise_right_shift(a, 2) FROM t",
+        SourceDialect::Trino,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(right.contains(">>"), "bitwise_right_shift → >>: {right}");
+}
+
+// ---------------------------------------------------------------------------
+// Trino → DataFusion: ROW / ARRAY type mappings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trino_to_datafusion_row_type() {
+    let sql = "CREATE TABLE t (r ROW(a INTEGER, b VARCHAR))";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("STRUCT<"),
+        "ROW → STRUCT<...> for DataFusion: {result}"
+    );
+    assert!(
+        !result.contains("STRUCT("),
+        "ROW must not become STRUCT(...) (DuckDB syntax): {result}"
+    );
+}
+
+#[test]
+fn trino_to_datafusion_array_type() {
+    // Trino T[] syntax (square bracket form) → ARRAY<T> for DataFusion
+    let sql = "CREATE TABLE t (a INTEGER[])";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Trino, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("ARRAY<"),
+        "T[] → ARRAY<T> for DataFusion: {result}"
+    );
+    assert!(
+        !result.contains("[]"),
+        "must not keep T[] syntax for DataFusion: {result}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Redshift → DataFusion: date/time functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redshift_to_datafusion_getdate_sysdate() {
+    let sql = "SELECT getdate(), sysdate() FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert_eq!(
+        result.matches("now()").count(),
+        2,
+        "getdate/sysdate → now(): {result}"
+    );
+}
+
+#[test]
+fn redshift_to_datafusion_dateadd() {
+    let sql = "SELECT dateadd(day, 7, d) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("INTERVAL"),
+        "dateadd → date + INTERVAL: {result}"
+    );
+}
+
+#[test]
+fn redshift_to_datafusion_datediff() {
+    // datediff('day', ...) → epoch arithmetic via to_unixtime
+    let result = papera::transpile_with_options(
+        "SELECT datediff(day, d1, d2) FROM t",
+        SourceDialect::Redshift,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(
+        result.contains("to_unixtime"),
+        "datediff('day') → epoch arithmetic: {result}"
+    );
+
+    // datediff('month', ...) → date_part arithmetic
+    let month_result = papera::transpile_with_options(
+        "SELECT datediff(month, d1, d2) FROM t",
+        SourceDialect::Redshift,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(
+        month_result.contains("date_part"),
+        "datediff('month') → date_part arithmetic: {month_result}"
+    );
+}
+
+#[test]
+fn redshift_to_datafusion_months_between() {
+    // months_between → date_part('year',...) and date_part('month',...) arithmetic
+    let result = papera::transpile_with_options(
+        "SELECT months_between(d1, d2) FROM t",
+        SourceDialect::Redshift,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(
+        result.contains("date_part"),
+        "months_between → date_part arithmetic: {result}"
+    );
+    assert!(
+        result.contains("'month'"),
+        "months_between uses 'month' datepart: {result}"
+    );
+}
+
+#[test]
+fn redshift_to_datafusion_add_months() {
+    let sql = "SELECT add_months(d, 3) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("INTERVAL"),
+        "add_months → date + INTERVAL: {result}"
+    );
+}
+
+#[test]
+fn redshift_to_datafusion_convert_timezone() {
+    let sql = "SELECT convert_timezone('US/Eastern', ts) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("AT TIME ZONE"),
+        "convert_timezone → AT TIME ZONE: {result}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Redshift → DataFusion: string functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redshift_to_datafusion_string_misc() {
+    let sql = "SELECT btrim(s), space(5), regexp_substr(s, '[0-9]+') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(result.contains("trim"), "btrim → trim: {result}");
+    assert!(result.contains("repeat"), "space → repeat: {result}");
+    assert!(
+        result.contains("regexp_match"),
+        "regexp_substr → regexp_match: {result}"
+    );
+}
+
+#[test]
+fn redshift_to_datafusion_nvl2_and_isnull() {
+    let nvl2 = papera::transpile_with_options(
+        "SELECT nvl2(a, b, c) FROM t",
+        SourceDialect::Redshift,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(nvl2.contains("CASE"), "nvl2 → CASE: {nvl2}");
+
+    let isnull = papera::transpile_with_options(
+        "SELECT isnull(a, b) FROM t",
+        SourceDialect::Redshift,
+        &datafusion_opts(),
+    )
+    .unwrap();
+    assert!(isnull.contains("coalesce"), "isnull → coalesce: {isnull}");
+}
+
+#[test]
+fn redshift_to_datafusion_listagg() {
+    let sql = "SELECT listagg(col, ',') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("string_agg"),
+        "listagg → string_agg: {result}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Redshift → DataFusion: hash functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redshift_to_datafusion_hash_functions() {
+    let sql = "SELECT md5(s), sha1(s), sha2(s, 256) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(result.contains("md5"), "md5 passthrough: {result}");
+    assert!(result.contains("sha1"), "sha1 passthrough: {result}");
+    assert!(result.contains("sha256"), "sha2(s, 256) → sha256: {result}");
+}
+
+// ---------------------------------------------------------------------------
+// Redshift → DataFusion: JSON functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redshift_to_datafusion_json_functions() {
+    let sql = "SELECT json_typeof(j), json_array_length(j), is_valid_json(j) FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(
+        result.contains("json_typeof"),
+        "json_typeof passthrough: {result}"
+    );
+    assert!(
+        result.contains("json_array_length"),
+        "json_array_length passthrough: {result}"
+    );
+    assert!(
+        result.contains("is_valid_json"),
+        "is_valid_json passthrough: {result}"
+    );
+}
+
+#[test]
+fn redshift_to_datafusion_json_extract_path_text() {
+    // json_extract_path_text is not supported for DataFusion target
+    let result = papera::transpile_with_options(
+        "SELECT json_extract_path_text(j, 'key') FROM t",
+        SourceDialect::Redshift,
+        &datafusion_opts(),
+    );
+    assert!(
+        result.is_err(),
+        "json_extract_path_text should be Unsupported for DataFusion target"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Redshift → DataFusion: other functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redshift_to_datafusion_strtol() {
+    // strtol is not supported for DataFusion target (hex string casting not available)
+    let result = papera::transpile_with_options(
+        "SELECT strtol('ff', 16) FROM t",
+        SourceDialect::Redshift,
+        &datafusion_opts(),
+    );
+    assert!(
+        result.is_err(),
+        "strtol should be Unsupported for DataFusion target"
+    );
+}
+
+#[test]
+fn redshift_to_datafusion_decode() {
+    let sql = "SELECT decode(status, 1, 'active', 'inactive') FROM t";
+    let result =
+        papera::transpile_with_options(sql, SourceDialect::Redshift, &datafusion_opts()).unwrap();
+    assert!(result.contains("CASE"), "decode → CASE: {result}");
 }

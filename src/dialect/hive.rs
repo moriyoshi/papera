@@ -29,7 +29,7 @@ impl Transpiler for HiveDialect {
         };
 
         // Expression-level transforms via VisitorMut
-        let mut rewriter = ExprRewriter::new(SourceDialect::Hive);
+        let mut rewriter = ExprRewriter::new(SourceDialect::Hive, opts.target);
         rewriter.rewrite(&mut stmt)?;
 
         Ok(stmt)

@@ -4,25 +4,27 @@ use std::ops::ControlFlow;
 use sqlparser::ast::{Expr, Query, SetExpr, Statement, TableFactor, VisitMut, VisitorMut};
 
 use crate::Result;
-use crate::dialect::SourceDialect;
+use crate::dialect::{SourceDialect, TargetDialect};
 use crate::transforms::functions::{self, FunctionMapping};
 use crate::transforms::lateral;
 use crate::transforms::types;
 use crate::transforms::unnest;
 
 /// AST rewriter that walks expressions and table factors, applying
-/// dialect-specific transformations for DuckDB compatibility.
+/// dialect-specific transformations for target-dialect compatibility.
 pub struct ExprRewriter {
     pub dialect: SourceDialect,
+    pub target: TargetDialect,
     pub function_map: HashMap<&'static str, FunctionMapping>,
     pub errors: Vec<crate::Error>,
 }
 
 impl ExprRewriter {
-    pub fn new(dialect: SourceDialect) -> Self {
+    pub fn new(dialect: SourceDialect, target: TargetDialect) -> Self {
         Self {
-            function_map: functions::function_mappings(dialect),
+            function_map: functions::function_mappings(dialect, target),
             dialect,
+            target,
             errors: Vec::new(),
         }
     }
@@ -61,7 +63,7 @@ impl VisitorMut for ExprRewriter {
 
         // Rewrite data types in CAST expressions
         if let Expr::Cast { data_type, .. } = expr
-            && let Err(e) = types::rewrite_data_type(data_type, self.dialect)
+            && let Err(e) = types::rewrite_data_type(data_type, self.dialect, self.target)
         {
             self.errors.push(e);
             return ControlFlow::Break(());

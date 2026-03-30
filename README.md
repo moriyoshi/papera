@@ -1,8 +1,8 @@
 # Papera
 
-A SQL compatibility layer that transpiles Trino, Redshift, and Hive SQL to DuckDB SQL.
+A SQL compatibility layer that transpiles Trino, Redshift, and Hive SQL to target-specific analytical SQL.
 
-papera parses source SQL using [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs), applies dialect-specific AST transformations, and emits DuckDB-compatible SQL. It handles function name differences, type mappings, DDL syntax variations, and more.
+papera parses source SQL using [sqlparser-rs](https://github.com/apache/datafusion-sqlparser-rs), applies dialect-specific AST transformations, and emits SQL for the selected target dialect. DuckDB remains the default and most fully supported target. The library API also exposes `TargetDialect::DataFusion` for callers that need DataFusion-compatible output, while the current CLI remains DuckDB-targeted.
 
 ## Installation
 
@@ -47,8 +47,9 @@ Usage: papera <trino|redshift|hive>
 
 ```rust
 use papera::{
-    transpile, transpile_with_options, SourceDialect, TranspileOptions,
-    ExternalTableBehavior, IcebergTableBehavior, CopyBehavior,
+    transpile, transpile_with_options, SourceDialect, TargetDialect,
+    TranspileOptions, ExternalTableBehavior, IcebergTableBehavior,
+    CopyBehavior,
 };
 
 // Simple usage
@@ -72,6 +73,14 @@ let opts = TranspileOptions {
     copy: CopyBehavior::MapToInsert,
     ..Default::default()
 };
+
+// Select a non-default output target through the library API
+let opts = TranspileOptions {
+    target: TargetDialect::DataFusion,
+    ..Default::default()
+};
+let result = transpile_with_options("SELECT split(name, ',') FROM t", SourceDialect::Trino, &opts).unwrap();
+// Output: SELECT string_to_array(name, ',') FROM t
 ```
 
 Custom SerDe class mappings for classes not covered by the built-in resolver:
@@ -112,7 +121,7 @@ See `cargo run --example multi_statement` for a full ETL script example.
 pub enum Error {
     /// The source SQL could not be parsed by sqlparser-rs.
     Parse(sqlparser::parser::ParserError),
-    /// The SQL uses a feature that cannot be transpiled to DuckDB
+    /// The SQL uses a feature that cannot be transpiled for the configured target
     /// (e.g., an unsupported type or a conversion that was not opted into).
     Unsupported(String),
 }
@@ -127,6 +136,8 @@ pub enum Error {
 See `examples/` for more complete usage patterns (`cargo run --example basic`, `cargo run --example migration`, `cargo run --example serde_resolver`).
 
 ## Feature Coverage
+
+Unless noted otherwise, the compatibility tables in this section document the default DuckDB target. DataFusion support exists through `TranspileOptions::target`, but it is narrower and should be treated as a separate compatibility path.
 
 ### Supported Dialects
 
@@ -480,7 +491,7 @@ The built-in mapping is substring-based and case-insensitive. For classes not li
 
 ### Parameterized Queries
 
-Parameterized queries (prepared statement placeholders) are passed through to DuckDB unchanged.
+Parameterized queries (prepared statement placeholders) are passed through unchanged by papera.
 
 | Dialect | Supported Styles | Example |
 |---------|-----------------|---------|
@@ -488,7 +499,7 @@ Parameterized queries (prepared statement placeholders) are passed through to Du
 | Redshift | `$1` | `SELECT * FROM t WHERE x = $1` |
 | Hive | `?`, `$1` | `SELECT * FROM t WHERE x = ?` |
 
-DuckDB uses `$1`-style positional parameters natively. The `?` style is also accepted by DuckDB in its client APIs.
+On the default DuckDB path, `$1`-style positional parameters are native. The `?` style is also accepted by DuckDB in its client APIs.
 
 ## Configuration
 
@@ -496,6 +507,7 @@ DuckDB uses `$1`-style positional parameters natively. The `?` style is also acc
 
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
+| `target` | `DuckDB`, `DataFusion` | `DuckDB` | The target SQL dialect to emit |
 | `external_table` | `MapToView`, `Error` | `Error` | How to handle `CREATE EXTERNAL TABLE` |
 | `iceberg_table` | `MapToView`, `Error` | `Error` | How to handle Iceberg tables (detected via TBLPROPERTIES) |
 | `copy` | `MapToInsert`, `Error` | `Error` | How to handle Redshift `COPY FROM` |
@@ -505,14 +517,14 @@ DuckDB uses `$1`-style positional parameters natively. The `?` style is also acc
 
 ```
 src/
-  lib.rs                  Public API, TranspileOptions
+  lib.rs                  Public API, TranspileOptions, crate-root exports
   error.rs                Error types
   main.rs                 CLI entry point
   transpiler/
     mod.rs                Transpiler trait
     rewrite.rs            ExprRewriter (VisitorMut-based AST walker)
   dialect/
-    mod.rs                SourceDialect enum
+    mod.rs                SourceDialect and TargetDialect enums
     trino.rs              Trino transpiler
     redshift.rs           Redshift transpiler
     hive.rs               Hive transpiler
@@ -546,17 +558,17 @@ papera uses a two-stage AST transformation pipeline:
 1. **Parse** source SQL with the dialect-specific parser from sqlparser-rs.
 2. **Statement-level transforms** restructure top-level `Statement` variants (e.g., converting `CREATE EXTERNAL TABLE` into `CREATE VIEW`, or rewriting `SHOW CREATE TABLE` into catalog queries).
 3. **Expression-level rewrites** via `ExprRewriter` (a `VisitorMut`-based AST walker) handle cross-cutting concerns such as function renaming, type casting, and table-factor normalization.
-4. **Emit** DuckDB-compatible SQL from the rewritten AST.
+4. **Emit** SQL for the selected target dialect from the rewritten AST.
 
-This split is intentional: statement handlers own structural changes that may replace one statement kind with another, while `ExprRewriter` handles expression-level rewrites that apply uniformly across statement types.
+This split is intentional: statement handlers own structural changes that may replace one statement kind with another, while `ExprRewriter` handles expression-level rewrites that apply uniformly across statement types. Source dialect and target dialect are separate dimensions in the design: source dialect controls parsing and dialect-specific preprocessing, while target dialect controls function mappings, type rewrites, selected SHOW behavior, and some DDL lowering decisions.
 
 ### Library-First Design
 
-The crate is designed as a library first. The CLI binary is feature-gated behind `cli` and is not built by default. Internal rewrite machinery under `src/transforms` is `pub(crate)`, keeping the stable public API surface small: `transpile`, `transpile_with_options`, dialect selection, options, and error types.
+The crate is designed as a library first. The CLI binary is feature-gated behind `cli` and is not built by default. Internal rewrite machinery under `src/transforms` is `pub(crate)`, keeping the stable public API surface small: `transpile`, `transpile_with_options`, source and target dialect selection, option types, the `SerdeClassResolver` extension hook, and shared error types.
 
 ### Opt-In Semantics for Risky Conversions
 
-Features that can silently change semantics or storage assumptions are controlled by `TranspileOptions` and default to `Error`. External-table-to-view and Iceberg-table-to-view conversions are examples: they are useful but alter the storage model, so callers must explicitly opt in.
+Features that can silently change semantics or storage assumptions are controlled by `TranspileOptions` and default to `Error`. External-table-to-view, Iceberg-table-to-view, and Redshift `COPY` lowering are examples: they are useful but alter storage or ingestion behavior, so callers must explicitly opt in.
 
 ### Parser as Feature Boundary
 
@@ -574,11 +586,15 @@ Function rewrites are classified by complexity:
 - **RenameReorder**: same function with reordered arguments (e.g., `CHARINDEX(sub, str)` to `strpos(str, sub)`).
 - **Custom**: the rewrite must produce a different AST shape entirely (e.g., `NVL2(e, a, b)` becomes a `CASE WHEN` expression, bitwise functions become infix operators).
 
-Declarative mappings are preferred where possible, with custom rewrites reserved for cases where DuckDB requires a structurally different expression.
+Declarative mappings are preferred where possible, with custom rewrites reserved for cases where the selected target requires a structurally different expression.
 
 ### Compatibility Model
 
-papera targets DuckDB execution correctness, not just syntactically valid output. Some mappings are approximations rather than exact semantic matches (e.g., `url_extract_*` functions use regex approximations). String-level rewrite success alone is not considered sufficient evidence of compatibility, which is why the test suite includes DuckDB execution tests alongside string-comparison tests.
+papera targets engine-correct output, not just syntactically valid SQL. DuckDB execution remains the strongest validation path in the current test strategy, and some mappings are approximations rather than exact semantic matches (e.g., `url_extract_*` functions use regex approximations). String-level rewrite success alone is not considered sufficient evidence of compatibility, which is why the test suite includes DuckDB execution tests alongside string-comparison tests.
+
+### Target Dialect Notes
+
+DuckDB is the mature target and the one documented by most compatibility tables in this README. The library also supports `TargetDialect::DataFusion`, but that path has narrower coverage and different unsupported cases, especially for reader-backed external-table and Iceberg rewrites that currently rely on DuckDB-specific functions.
 
 ## Known Limitations
 
@@ -593,6 +609,10 @@ Nested `ROW` types such as `ROW(x BIGINT, y ROW(i DOUBLE, j DOUBLE))` fail to pa
 ### Approximate mappings
 
 Some functions are approximations rather than exact semantic matches. For example, `url_extract_*` functions use regex-based approximations. Always validate output against DuckDB execution for compatibility-sensitive queries.
+
+### DataFusion target scope
+
+`TargetDialect::DataFusion` is available through the library API, but it is not feature-equivalent with DuckDB. In particular, reader-backed external-table and Iceberg rewrites remain DuckDB-specific, and some DataFusion-specific mappings are still better treated as explicit unsupported cases than as silent approximations.
 
 ### Redshift COPY options
 

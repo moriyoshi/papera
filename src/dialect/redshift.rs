@@ -30,7 +30,7 @@ impl Transpiler for RedshiftDialect {
         };
 
         // Expression-level transforms via VisitorMut
-        let mut rewriter = ExprRewriter::new(SourceDialect::Redshift);
+        let mut rewriter = ExprRewriter::new(SourceDialect::Redshift, opts.target);
         rewriter.rewrite(&mut stmt)?;
 
         Ok(stmt)

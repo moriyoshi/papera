@@ -4,7 +4,7 @@ pub mod transpiler;
 
 pub(crate) mod transforms;
 
-pub use dialect::SourceDialect;
+pub use dialect::{SourceDialect, TargetDialect};
 pub use error::{Error, Result};
 pub use transpiler::Transpiler;
 
@@ -100,6 +100,8 @@ impl fmt::Debug for SerdeClassResolver {
 /// Options controlling transpilation behavior.
 #[derive(Debug, Clone, Default)]
 pub struct TranspileOptions {
+    /// The target SQL dialect to emit. Defaults to [`TargetDialect::DuckDB`].
+    pub target: TargetDialect,
     pub external_table: ExternalTableBehavior,
     pub iceberg_table: IcebergTableBehavior,
     pub copy: CopyBehavior,
