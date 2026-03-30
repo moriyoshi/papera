@@ -1,6 +1,6 @@
 [package]
 name = "papera"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A SQL compatibility layer that transpiles Trino and Redshift SQL to DuckDB SQL"
 license = "MIT"
